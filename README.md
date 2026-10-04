@@ -1,35 +1,36 @@
 # kaggle-pocketpal-bridge
 
-OpenAI-compatible bridge: Kaggle free AI quota (+ web search, planned) -> PocketPal (via ngrok).
+OpenAI-compatible bridge for PocketPal: Kaggle free AI quota + free FOSS web search (SearXNG).
 
-## How it works
-- A Kaggle **Benchmarks** notebook runs `bridge.py`: a FastAPI server exposing
-  `GET /v1/models` and `POST /v1/chat/completions` (OpenAI format).
-- Requests are forwarded to `kaggle_benchmarks.llms[model].prompt(...)`, which uses the
-  free Kaggle AI quota.
-- `pyngrok` publishes port 8000 as a public URL that PocketPal connects to.
+    PocketPal -> ngrok static domain -> [GitHub Actions: gateway + SearXNG] -> Kaggle notebook (LLM)
 
-## Setup
-1. Open your Kaggle Benchmarks notebook.
-2. Add your ngrok authtoken as a secret named `NGROK_TOKEN` (Add-ons -> Secrets), or set the env var.
-3. Paste/run `bridge.py`. It prints the **PocketPal Server URL** (no `/v1`).
-4. In PocketPal: add a remote server, **Server Type: OpenAI**, paste the URL, any API key,
-   then pick a model from the list.
+## Parts
+- gateway/gateway.py - runs in GitHub Actions. OpenAI API, API-key check, web search + page extraction, forwards to Kaggle.
+- searxng/settings.yml - SearXNG metasearch (many engines, JSON output), run in Docker by the workflow.
+- gateway/run_tunnel.py - publishes the gateway on the ngrok domain and queues the next run for handover.
+- kaggle/bridge.py - Kaggle notebook cell: LLM backend (kbench.llms), free Cloudflare tunnel, registers with the gateway every 15 s.
+- tests/ - end-to-end checks with a fake backend.
+- .github/workflows/live.yml - mode `test` (checks only) or `live` (publish on ngrok).
 
-Last known URL (changes whenever the tunnel restarts):
-`https://scrubbed-calcium-subscript.ngrok-free.dev`
+## Secrets (never commit values)
+- GitHub repo secrets: NGROK_TOKEN, BRIDGE_KEY
+- Kaggle (Add-ons -> Secrets): BRIDGE_KEY (same value)
 
-## Notes
-- Keep the Kaggle notebook open and running; if the session stops, the link goes offline.
-- Replies arrive all at once, not word by word (the full answer is sent as one chunk).
-- Cost: each message uses the Kaggle AI quota (about $10/day and $100/month). Check it in the
-  notebook's right-side panel -> Benchmark Task -> Daily/Monthly AI Quota (tap refresh).
-- Start with `google/gemini-2.5-flash` or `anthropic/claude-sonnet-5@default`; use bigger
-  models (Opus, GPT-6, Pro) sparingly.
-- Models don't know today's date or recent events. Add a system prompt such as
-  "Your knowledge may be outdated; say so when unsure about recent events."
-- Real current info needs a web-search step (e.g. Tavily free tier API key): search first,
-  then pass the results to the model. Not implemented yet.
-- Regenerate the Kaggle and ngrok tokens once everything is stable (they were shared in chat),
-  then update the `NGROK_TOKEN` secret and re-run the cell.
-- Never commit tokens to this repo.
+## Use
+1. Kaggle: stop any old cell that opens an ngrok tunnel. Run kaggle/bridge.py as one cell.
+2. GitHub: Actions -> live -> Run workflow -> mode `live`.
+3. PocketPal: Server Type OpenAI, URL https://scrubbed-calcium-subscript.ngrok-free.dev (no /v1), API key = BRIDGE_KEY.
+4. Choose a model ending in `:web` (e.g. google/gemini-2.5-flash:web) for live web search.
+   Models without `:web` skip search and save quota. Any model id works with `:web` appended.
+
+## How web search works
+Query = your last message (plus the previous one for very short follow-ups) -> SearXNG (general + news) ->
+de-duplicated top 8 -> text extracted from the top 3 pages (trafilatura) -> injected as a system message
+with today's date and [n] citation numbers.
+
+## Limits
+- A GitHub Actions job lasts at most 6 h. The workflow queues its own successor about 10 min before the end
+  (expect a 1-2 min gap). Private repo on the free plan: 2000 Actions minutes per month (about 33 h);
+  public repos are unlimited.
+- Replies arrive all at once. Each message uses Kaggle quota (about $10/day, $100/month).
+- Regenerate tokens that were pasted into chats.

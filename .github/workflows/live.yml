@@ -1,0 +1,49 @@
+name: live
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test = run checks only (no tunnel); live = publish on the ngrok domain"
+        type: choice
+        options: [test, live]
+        default: test
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: run-${{ inputs.mode }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      BRIDGE_KEY: ${{ secrets.BRIDGE_KEY }}
+      NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
+      SEARXNG_URL: http://127.0.0.1:8888
+      MODE: ${{ inputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install gateway deps
+        run: pip install -r gateway/requirements.txt
+      - name: Start SearXNG
+        run: bash scripts/start_searxng.sh
+      - name: Start gateway
+        run: bash scripts/start_gateway.sh
+      - name: End-to-end checks
+        run: python tests/e2e.py
+        env:
+          PYTHONPATH: .
+      - name: Publish on ngrok (live mode only)
+        if: inputs.mode == 'live'
+        run: python gateway/run_tunnel.py
+      - name: Logs on failure
+        if: failure()
+        run: bash scripts/logs.sh
