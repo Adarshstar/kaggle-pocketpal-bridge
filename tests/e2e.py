@@ -20,8 +20,14 @@ try:
     check("bad key rejected", r.status_code == 401, r.status_code)
 
     r = httpx.get(G + "/search", params={"q": "python programming language"}, headers=H, timeout=30)
-    res = r.json().get("results", [])
+    j = r.json()
+    res = j.get("results", [])
+    print("DEBUG", j.get("debug"))
     check("raw search returns results", len(res) > 0, f"{len(res)} results, first: {res[0]['url'] if res else None}")
+    r2 = httpx.get(G + "/search", params={"q": "latest stable python release"}, headers=H, timeout=30).json()
+    print("DEBUG2", r2.get("debug"))
+    print([x["url"] for x in r2["results"]])
+    check("non-news web results present", any("news" not in " ".join(x["engines"]) for x in r2["results"]))
 
     ids = [m["id"] for m in httpx.get(G + "/v1/models", headers=H, timeout=30).json()["data"]]
     check("models include :web variants", any(i.endswith(":web") for i in ids), ids[:3])

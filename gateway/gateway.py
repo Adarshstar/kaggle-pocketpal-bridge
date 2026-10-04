@@ -56,12 +56,44 @@ def make_query(msgs: list) -> str:
     return re.sub(r"\s+", " ", q)[-300:]
 
 
+LAST = {"unresponsive": [], "searx": 0, "ddgs": 0, "ddgs_error": ""}
+
+
+def ddgs_search(q: str) -> list:
+    try:
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
+        rows = DDGS().text(q, max_results=10) or []
+        LAST["ddgs_error"] = ""
+        return [{"title": x.get("title", ""), "url": x.get("href") or x.get("url", ""),
+                 "content": x.get("body", ""), "engines": ["ddgs"]} for x in rows]
+    except Exception as e:
+        LAST["ddgs_error"] = f"{type(e).__name__}: {e}"[:200]
+        return []
+
+
 async def searx(client: httpx.AsyncClient, q: str) -> list:
-    r = await client.get(f"{SEARX}/search", params={
-        "q": q, "format": "json", "language": "auto", "categories": "general,news"}, timeout=20)
-    r.raise_for_status()
+    raw = []
+    try:
+        r = await client.get(f"{SEARX}/search", params={
+            "q": q, "format": "json", "language": "auto", "categories": "general,news"}, timeout=20)
+        r.raise_for_status()
+        j = r.json()
+        raw = j.get("results", [])
+        LAST["unresponsive"] = j.get("unresponsive_engines", [])
+    except Exception as e:
+        LAST["unresponsive"] = [["searxng", str(e)[:100]]]
+    web = await asyncio.to_thread(ddgs_search, q)
+    LAST["searx"], LAST["ddgs"] = len(raw), len(web)
+
+    def is_news(x):
+        return bool(x.get("engines")) and all("news" in e for e in x["engines"])
+
+    raw = web + [x for x in raw if not is_news(x)] + [x for x in raw if is_news(x)]
     seen, out = set(), []
-    for x in r.json().get("results", []):
+    for x in raw:
         u = x.get("url", "")
         p = urlparse(u)
         k = (p.netloc.lower().removeprefix("www."), p.path.rstrip("/"))
@@ -147,7 +179,8 @@ async def register(req: Request, authorization: Optional[str] = Header(None)):
 async def search(q: str, authorization: Optional[str] = Header(None)):
     check(authorization)
     async with httpx.AsyncClient() as client:
-        return {"query": q, "results": await searx(client, q)}
+        res = await searx(client, q)
+    return {"query": q, "results": res, "debug": LAST}
 
 
 @app.get("/v1/models")
