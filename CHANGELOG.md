@@ -11,6 +11,7 @@
   streamed text into reasoning/answer live. Old (non-stream) notebooks still work via the simulated stream.
 - PocketPal: default REASONING_FORMAT is now `tags` (`<think>..</think>` in content, which PocketPal parses itself);
   add `:field` to a model id for `reasoning_content` instead.
+- Live model matrix recorded in HANDOFF.md 6b (Gemini, Claude, Grok, DeepSeek show thinking; GPT-5.x, GLM, Gemma do not).
 - Tests: tests/test_bridge.py runs the bridge against the real kaggle_benchmarks package with a fake LLM.
 - Verified live 2026-10-04: gemini-2.5-flash `:think` returns clean answer + separate thoughts (non-stream) and streams
   thoughts live inside `<think>` (the proxy embeds the tags); `:web` streams search progress, answer and Sources.

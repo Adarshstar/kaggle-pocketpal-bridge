@@ -15,7 +15,7 @@ OpenAI-compatible bridge for PocketPal: Kaggle free AI quota + free FOSS web sea
 - .github/workflows/live.yml - mode `test` (checks only) or `live` (publish on ngrok).
 
 ## Secrets (never commit values)
-- GitHub repo secrets: NGROK_TOKEN, BRIDGE_KEY
+- GitHub repo secrets: NGROK_TOKEN, BRIDGE_KEY, KAGGLE_API_TOKEN
 - Kaggle (Add-ons -> Secrets): BRIDGE_KEY (same value)
 
 ## Use
@@ -34,11 +34,19 @@ with today's date and [n] citation numbers.
 - A GitHub Actions job lasts at most 6 h. The workflow queues its own successor about 10 min before the end
   (expect a 1-2 min gap). Private repo on the free plan: 2000 Actions minutes per month (about 33 h);
   public repos are unlimited.
-- Replies arrive all at once. Each message uses Kaggle quota (about $10/day, $100/month).
+- Each message uses Kaggle quota (about $10/day, $100/month).
 - Regenerate tokens that were pasted into chats.
 
-## v2: thinking controls, streaming, search v2
-Flags on any model id: `:web` search, `:think` / `:low` / `:medium` / `:high` thinking effort, `:nothink`, `:tags`.
-E.g. `google/gemini-2.5-pro:web:high`. Thinking (and search progress) is streamed in `reasoning_content`, separate from the
-answer; use `:tags` if PocketPal does not show it. Details: HANDOFF.md section 2b, CHANGELOG.md.
-Deploy: `gh workflow run live.yml -f mode=live`; after changing kaggle/bridge.py run `gh workflow run kaggle-push.yml`.
+## v3: real streaming, native thinking, search v2
+Flags on any model id: `:web` search, `:think` / `:low` / `:medium` / `:high` thinking effort, `:nothink`,
+`:tags` (thinking inside `<think>` in content, the default, PocketPal parses it) or `:field` (`reasoning_content`).
+E.g. `google/gemini-2.5-pro:web:high`.
+- Streaming is real (token by token) with bridge v3; thinking and search progress stream live before the answer.
+- Thinking uses the model's own reasoning through kaggle_benchmarks (`reasoning=` parameter), not a prompt trick.
+- Details: HANDOFF.md (sections 2b, 2c, 6b), CHANGELOG.md.
+- Deploy: `gh workflow run live.yml -f mode=live`; after changing kaggle/bridge.py run `gh workflow run kaggle-push.yml`,
+  then check `/health` shows `backend_caps: ["stream","native_reasoning"]`.
+
+## Model support (tested 2026-10-04)
+Chat + streaming work on every model tested. Thinking is shown for Gemini, Claude, Grok and DeepSeek-R1; not for
+GPT-5.x, GLM-5 and Gemma (they do not return reasoning). See HANDOFF.md section 6b.

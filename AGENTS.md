@@ -4,3 +4,6 @@ Rules: never commit secret values (use GitHub secrets); run `gh workflow run liv
 check `/health` after redeploying; keep the README and HANDOFF.md up to date when you change something.
 Also: run `PYTHONPATH=. python tests/test_units.py` and `scripts/dev_e2e.py` before pushing; record every change in CHANGELOG.md;
 work on a branch, run the `test` workflow on it, then merge and run `live`. After changing kaggle/bridge.py run the `kaggle-push` workflow.
+
+Also: `PYTHONPATH=. python tests/test_bridge.py` (needs `pip install kaggle-benchmarks`) tests the bridge against the real library.
+Current state: gateway v3 + bridge v3 live; model matrix in HANDOFF.md 6b; unverified: PocketPal rendering of thinking.

@@ -1,8 +1,8 @@
 # HANDOFF - full context for the next AI agent
 
-Written 2026-10-04. Owner: GitHub/Kaggle user `Adarshstar` (Kaggle username `adarshstar`).
+Written 2026-10-04, updated after v3 (real streaming + native thinking). Owner: GitHub/Kaggle user `Adarshstar` (Kaggle username `adarshstar`).
 Goal of the project: use the free Kaggle Benchmarks AI quota as an OpenAI-compatible API for the
-**PocketPal** Android app, with free FOSS web search added. Everything is live and working as of this note.
+**PocketPal** Android app, with free FOSS web search added. Everything is live and working as of this note (gateway v3, bridge v3).
 
 NO SECRET VALUES ARE IN THIS REPO. Secrets are referred to by name only (see "Secrets").
 
@@ -122,6 +122,21 @@ gpt-5.6-luna/sol/terra, gpt-6-astra, gpt-oss-120b/20b; deepseek-ai/deepseek-r1-0
 xai/grok-4.20(non-reasoning/reasoning), grok-4.5, grok-4.6; zai/glm-5. Start with gemini-2.5-flash or claude-sonnet-5;
 use big models (Opus, GPT-6, Pro) sparingly because of the quota.
 
+## 6b. Model test matrix (live, 2026-10-04, prompt "17*23", bridge v3)
+| model | answer | stream | thinking shown |
+|---|---|---|---|
+| google/gemini-2.5-flash | ok | ok | yes |
+| anthropic/claude-haiku-4-5@20251001 | ok | ok | yes |
+| xai/grok-4.20-non-reasoning | ok | ok | yes |
+| deepseek-ai/deepseek-r1-0528 | ok | ok | yes (always thinks, even without :think) |
+| openai/gpt-5.4-nano | ok | ok | no (reasoning not returned) |
+| zai/glm-5 | ok | ok | no |
+| google/gemma-4-26b-a4b | ok | ok | no |
+| qwen/qwen3-235b-a22b-instruct-2507 | HTTP 429 from Kaggle proxy (overload) | same | not tested |
+Not tested (quota): Claude Sonnet/Opus, GPT-5.5/6, Gemini Pro and the rest of the 41 ids. Models without returned
+reasoning give a normal answer with an empty thinking block when `:think` is used; use the plain id for them.
+Gemini 2.5 Pro cannot turn thinking off, so `:nothink` may fall back to default thinking (the bridge retries plainer params).
+
 ## 7. History / decisions (why things are the way they are)
 1. Repo `kaggle-pocketpal-bridge` (private) was created empty. First version: the user's original single notebook cell
    (FastAPI + pyngrok inside Kaggle, no search). That worked and served PocketPal on the ngrok domain.
@@ -146,14 +161,14 @@ use big models (Opus, GPT-6, Pro) sparingly because of the quota.
 - Kaggle notebook runs have a session time limit; when it ends `/health` shows backend_connected:false. Fix: re-push the notebook.
 - Search runs from datacenter IPs: DuckDuckGo/Brave/Google News blocked, quality varies between queries. Ideas: add engines in
   searxng/settings.yml, a free API search (Tavily/Brave API keys as GitHub secrets), better query rewriting with an LLM call.
-- Streaming is simulated (full answer replayed in chunks); kbench gives no token stream. Thinking is prompt-based, so
-  models that ignore the `<think>` instruction just show no thinking. Planner costs one small Kaggle call per `:web` message.
+- Streaming is real with bridge v3 (older bridges: simulated). Thinking is native (THINK_MODE=native); models that do not return
+  reasoning show none. The search planner costs one small Kaggle call per `:web` message. Upstream 429s (e.g. Qwen) surface as `[Proxy Error]`.
 - Old notebook sessions that still hold the ngrok pool (pooling_enabled) can steal requests; make sure no old cell is running.
 - If ngrok complains about simultaneous sessions, make sure only one agent (the Actions job) uses NGROK_TOKEN.
 - The gateway keeps the backend URL in memory only; it relearns it from the 15 s heartbeat after a restart.
 
 ## 9. Ideas for next work
-- True token streaming if kaggle_benchmarks ever exposes it (check GET /v1/backend-info).
+- (done in v3: real streaming, native thinking.) Still open: confirm how PocketPal renders `<think>` vs `reasoning_content`.
 - Smarter search: LLM query rewriting, `time_range`, more engines, source-quality ranking, caching, page-fetch timeouts.
 - Auto re-launch of the Kaggle notebook (scheduled `kaggle kernels push` from a GitHub Action using KAGGLE_API_TOKEN).
 - Quota guard: count requests and warn/limit expensive models.
