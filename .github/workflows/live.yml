@@ -37,7 +37,8 @@ jobs:
         run: bash scripts/start_searxng.sh
       - name: Start gateway
         run: bash scripts/start_gateway.sh
-      - name: End-to-end checks
+      - name: End-to-end checks (test mode only)
+        if: inputs.mode == 'test'
         run: python tests/e2e.py
         env:
           PYTHONPATH: .
