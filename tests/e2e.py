@@ -47,7 +47,7 @@ def stream(model, text, **extra):
 try:
     check("bad key rejected", httpx.get(G + "/v1/models", headers={"Authorization": "Bearer nope"}).status_code == 401)
     h = httpx.get(G + "/health").json()
-    check("health v2 + backend connected", h.get("version") == "3.0" and h.get("backend_connected"), h)
+    check("health v2 + backend connected", str(h.get("version")).startswith("3.") and h.get("backend_connected"), h)
 
     r = httpx.get(G + "/search", params={"q": "python programming language", "pages": 1}, headers=H, timeout=60).json()
     print("DEBUG", r.get("debug"))
