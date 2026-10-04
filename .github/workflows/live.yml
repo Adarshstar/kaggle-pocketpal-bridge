@@ -37,6 +37,8 @@ jobs:
         run: python tests/test_units.py
         env:
           PYTHONPATH: .
+      - name: Bridge tests (real kaggle_benchmarks, fake LLM)
+        run: pip install kaggle-benchmarks && python tests/test_bridge.py
       - name: Start SearXNG
         run: bash scripts/start_searxng.sh
       - name: Start gateway

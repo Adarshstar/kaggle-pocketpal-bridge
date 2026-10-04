@@ -47,7 +47,7 @@ def stream(model, text, **extra):
 try:
     check("bad key rejected", httpx.get(G + "/v1/models", headers={"Authorization": "Bearer nope"}).status_code == 401)
     h = httpx.get(G + "/health").json()
-    check("health v2 + backend connected", h.get("version") == "2.0" and h.get("backend_connected"), h)
+    check("health v2 + backend connected", h.get("version") == "3.0" and h.get("backend_connected"), h)
 
     r = httpx.get(G + "/search", params={"q": "python programming language", "pages": 1}, headers=H, timeout=60).json()
     print("DEBUG", r.get("debug"))
@@ -73,29 +73,36 @@ try:
     m = chat("google/gemini-2.5-flash", "hi")
     check("plain chat skips search", "web access" not in m["content"] and "reasoning_content" not in m, m["content"][:80])
 
-    m = chat("google/gemini-2.5-flash:think", "why is the sky blue")
-    check("think -> reasoning_content separate", m.get("reasoning_content") == "fake reasoning about the question"
+    sn = lambda: httpx.get(f"http://127.0.0.1:{BP}/seen").json()
+    m = chat("google/gemini-2.5-flash:think:field", "why is the sky blue")
+    check("think (native) -> reasoning_content separate", m.get("reasoning_content") == "fake native thoughts"
           and "<think>" not in m["content"] and "ECHO" in m["content"], m)
+    check("native mode sends effort, no prompt instruction", sn()["reasoning"] == "medium"
+          and "<think> and </think>" not in m["content"], sn())
     m = chat("google/gemini-2.5-flash:think:tags", "why is the sky blue")
-    check("tags -> <think> inside content", m["content"].startswith("<think>\nfake reasoning") and "reasoning_content" not in m)
+    check("tags -> <think> inside content", m["content"].startswith("<think>\nfake native") and "reasoning_content" not in m, m["content"][:80])
     m = chat("google/gemini-2.5-flash", "why is the sky blue", reasoning_effort="high")
-    check("reasoning_effort request field honoured", m.get("reasoning_content") and "Think deeply" in m["content"], m)
+    check("reasoning_effort request field -> native high", sn()["reasoning"] == "high", sn())
     m = chat("google/gemini-2.5-flash:nothink", "why is the sky blue")
-    check("nothink -> no thinking instruction", "<think> and </think>" not in m["content"] and "reasoning_content" not in m)
+    check("nothink -> effort none, no thinking", sn()["reasoning"] == "none" and "reasoning_content" not in m
+          and "<think>" not in m["content"], m)
 
     chat("google/gemini-2.5-flash", "hi", temperature=0.3, max_completion_tokens=77, top_p=0.9)
     seen = httpx.get(f"http://127.0.0.1:{BP}/seen").json()["params"]
     check("sampling params reach backend", seen == {"temperature": 0.3, "top_p": 0.9, "max_tokens": 77}, seen)
 
-    rs, ct, us, done = stream("google/gemini-2.5-flash:web:think", "latest python release",
+    rs, ct, us, done = stream("google/gemini-2.5-flash:web:think:field", "latest python release",
                               stream_options={"include_usage": True})
     check("stream: [DONE] + usage", done and us and us["total_tokens"] > 0, us)
-    check("stream: thinking separate from answer", "fake reasoning" in rs and "Searching" in rs
-          and "<think>" not in ct and "ECHO" in ct, rs[:200])
+    check("stream: real backend stream used", sn()["stream"] is True, sn())
+    check("stream: thinking separate (tags split across chunks)", "fake native thoughts" in rs
+          and "Searching" in rs and "<think>" not in ct and "<thi" not in ct and "ECHO" in ct, (rs[:200], ct[:80]))
+    check("stream :web appends Sources", "**Sources**" in ct)
     rs, ct, us, done = stream("google/gemini-2.5-flash", "hi")
-    check("stream plain: answer only", done and rs == "" and "ECHO" in ct)
-    rs, ct, us, done = stream("google/gemini-2.5-flash:think:tags", "hi")
-    check("stream tags: <think> block in content", ct.startswith("<think>\n") and "</think>" in ct and rs == "", ct[:120])
+    check("stream plain: answer only", done and rs == "" and "ECHO" in ct and "<think>" not in ct, (rs, ct[:60]))
+    rs, ct, us, done = stream("google/gemini-2.5-flash:think", "hi")
+    check("stream tags (default): one <think> block then answer", ct.startswith("<think>\n") and "fake native thoughts" in ct
+          and ct.count("</think>") == 1 and "ECHO" in ct.split("</think>")[1] and rs == "", ct[:140])
 finally:
     backend.terminate()
 sys.exit(1 if fails else 0)

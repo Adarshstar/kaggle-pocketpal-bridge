@@ -18,10 +18,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import reasoning as R
 from . import search as S
 
-VERSION = "2.0"
+VERSION = "3.0"
 KEY = os.environ.get("BRIDGE_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "google/gemini-2.5-flash")
-REASONING_FORMAT = os.environ.get("REASONING_FORMAT", "field")  # field | tags
+REASONING_FORMAT = os.environ.get("REASONING_FORMAT", "tags")  # field | tags
 WEB_MODELS = [m for m in os.environ.get(
     "WEB_MODELS",
     "google/gemini-2.5-flash,google/gemini-2.5-pro,anthropic/claude-sonnet-5@default,"
@@ -29,7 +29,7 @@ WEB_MODELS = [m for m in os.environ.get(
 ).split(",") if m]
 BACKEND_TIMEOUT = int(os.environ.get("BACKEND_TIMEOUT", "300"))
 
-backend = {"url": os.environ.get("BACKEND_URL", "").rstrip("/"), "seen": 0.0}
+backend = {"url": os.environ.get("BACKEND_URL", "").rstrip("/"), "seen": 0.0, "caps": None}
 app = FastAPI(title="kaggle-pocketpal-gateway", version=VERSION)
 
 
@@ -66,30 +66,105 @@ async def ask_text(model: str, msgs: list, params: Optional[dict] = None) -> str
         return f"[Bridge Error] {e}"
 
 
-async def pipeline(base: str, msgs: list, web: bool, effort: Optional[str], params: dict, progress):
-    """Search (optional) -> thinking instruction -> backend -> split. Returns (reasoning, answer, info)."""
+async def get_caps() -> list:
+    """Backend capabilities ('stream', 'native_reasoning'); learned from /register or /v1/info (old notebooks: [])."""
+    if backend["caps"] is None and backend["url"]:
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(f"{backend['url']}/v1/info", headers={"X-Backend-Key": KEY}, timeout=15)
+                backend["caps"] = list(r.json().get("caps") or [])
+        except Exception:
+            return []
+    return backend["caps"] or []
+
+
+async def call_full(model: str, msgs: list, params: Optional[dict], effort: Optional[str]):
+    """Non-streaming call that also returns the model's separate thoughts: (text, thoughts)."""
+    if not backend["url"]:
+        raise BackendError("The Kaggle notebook is not connected. Run the bridge cell in your notebook.")
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{backend['url']}/v1/chat/completions",
+                json={"model": model, "messages": msgs, "stream": False, "params": params or {},
+                      "reasoning": effort},
+                headers={"X-Backend-Key": KEY, "User-Agent": "gateway"}, timeout=BACKEND_TIMEOUT)
+            r.raise_for_status()
+            m = r.json()["choices"][0]["message"]
+            return m["content"], m.get("reasoning_content") or ""
+    except Exception as e:
+        raise BackendError(f"backend unreachable ({type(e).__name__}: {e}). Re-run the notebook cell.")
+
+
+async def backend_stream(model: str, msgs: list, params: Optional[dict], effort: Optional[str]):
+    """Real token stream from the Kaggle bridge. Yields ('delta'|'reasoning'|'error', text)."""
+    async with httpx.AsyncClient() as client:
+        async with client.stream(
+                "POST", f"{backend['url']}/v1/chat/completions",
+                json={"model": model, "messages": msgs, "stream": True, "params": params or {},
+                      "reasoning": effort},
+                headers={"X-Backend-Key": KEY, "User-Agent": "gateway"},
+                timeout=httpx.Timeout(BACKEND_TIMEOUT, connect=15)) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                j = json.loads(line[6:])
+                if j.get("done"):
+                    return
+                for k in ("delta", "reasoning", "error"):
+                    if j.get(k):
+                        yield k, j[k]
+
+
+THINK_MODE = os.environ.get("THINK_MODE", "native")  # native: model's own thinking | prompt: <think> instruction
+
+
+async def use_native() -> bool:
+    return THINK_MODE == "native" and "native_reasoning" in await get_caps()
+
+
+async def prepare(msgs: list, web: bool, effort: Optional[str], native: bool, progress):
+    """Search (optional) + thinking instruction (only when not native). Returns (messages, search info)."""
     work, info = msgs, None
     if web:
         ctx, info = await S.build_context(msgs, ask=call_backend, progress=progress)
         work = [{"role": "system", "content": ctx}] + msgs
-    work = R.with_instruction(work, R.thinking_instruction(effort))
-    thinking_on = effort not in (None, "none")
-    if web or thinking_on:  # plain chats stay silent: no thinking panel at all
-        progress("Asking the model" + (f" (thinking: {effort})" if thinking_on else ""))
-    text = await ask_text(base, work, params)
-    reasoning, answer = R.split_reasoning(text)
-    if effort == "none":
-        reasoning = ""
-    if not answer and reasoning:  # model put everything inside the tags
+    if not native:
+        work = R.with_instruction(work, R.thinking_instruction(effort))
+    on = effort not in (None, "none")
+    if web or on:
+        progress("Asking the model" + (f" (thinking: {effort})" if on else ""))
+    return work, info
+
+
+async def pipeline(base: str, msgs: list, web: bool, effort: Optional[str], params: dict, progress):
+    """Non-streaming: prepare -> backend -> split. Returns (reasoning, answer, info)."""
+    native = await use_native()
+    work, info = await prepare(msgs, web, effort, native, progress)
+    try:
+        text, thoughts = await call_full(base, work, params, effort if native else None)
+    except BackendError as e:
+        text, thoughts = f"[Bridge Error] {e}", ""
+    tag_r, answer = R.split_reasoning(text)
+    reasoning = "" if effort == "none" else (thoughts or tag_r)
+    if not answer and reasoning:
         answer, reasoning = reasoning, ""
     if web and info:
         answer += S.sources_footer(answer, info)
     return reasoning, answer, info
 
 
+async def _next(agen):
+    try:
+        return await agen.__anext__()
+    except StopAsyncIteration:
+        return None
+
+
 @app.get("/health")
 def health():
-    return {"ok": True, "version": VERSION, "backend_connected": bool(backend["url"]),
+    return {"ok": True, "version": VERSION, "backend_connected": bool(backend["url"]), "backend_caps": backend["caps"],
             "backend_last_seen_s": round(time.time() - backend["seen"]) if backend["seen"] else None}
 
 
@@ -99,6 +174,10 @@ async def register(req: Request, authorization: Optional[str] = Header(None)):
     url = (await req.json()).get("url", "").rstrip("/")
     if not url.startswith("https://"):
         raise HTTPException(400, "url must be https")
+    body = await req.json()
+    caps = body.get("caps")
+    if url != backend["url"] or caps is not None:
+        backend["caps"] = list(caps) if caps is not None else None
     backend.update(url=url, seen=time.time())
     return {"ok": True}
 
@@ -167,52 +246,120 @@ def _delta_chunk(cid, created, model, delta, finish=None):
 async def stream_response(raw_model, base, msgs, web, effort, params, tags, include_usage):
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     q: asyncio.Queue = asyncio.Queue()
-    task = asyncio.create_task(pipeline(base, msgs, web, effort, params, lambda s: q.put_nowait(s)))
-    state = {"open": False}
+    st = {"open": False, "answer": "", "mr": ""}
 
-    def reason(text):  # one piece of thinking text, in the configured format
+    def chunk(delta):
+        return _delta_chunk(cid, created, raw_model, delta)
+
+    def reason(text):
         if tags:
-            pre = "" if state["open"] else "<think>\n"
-            state["open"] = True
-            return _delta_chunk(cid, created, raw_model, {"content": pre + text})
-        return _delta_chunk(cid, created, raw_model, {"reasoning_content": text})
+            pre = "" if st["open"] else "<think>\n"
+            st["open"] = True
+            return chunk({"content": pre + text})
+        return chunk({"reasoning_content": text})
 
-    yield _delta_chunk(cid, created, raw_model, {"role": "assistant", "content": ""})
+    def content(text):
+        st["answer"] += text
+        if tags and st["open"]:
+            st["open"] = False
+            text = "\n</think>\n\n" + text
+        return chunk({"content": text})
+
+    def emit(pairs):
+        return [reason(t) if k == "r" else content(t) for k, t in pairs]
+
+    yield chunk({"role": "assistant", "content": ""})
+    native = await use_native()
+    can_stream = "stream" in await get_caps()
+    prep = asyncio.create_task(prepare(msgs, web, effort, native, lambda s: q.put_nowait(s)))
     getter = None
     while True:
         if getter is None:
             getter = asyncio.ensure_future(q.get())
-        done, _ = await asyncio.wait({getter, task}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait({getter, prep}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
         if getter in done:
             yield reason("- " + getter.result() + "\n")
             getter = None
             continue
-        if task in done:
+        if prep in done:
             break
         yield ": keepalive\n\n"
     if getter is not None and not getter.done():
         getter.cancel()
     while not q.empty():
         yield reason("- " + q.get_nowait() + "\n")
+    info = None
     try:
-        thinking, answer, _ = task.result()
+        work, info = prep.result()
     except Exception as e:
-        thinking, answer = "", f"[Bridge Error] {type(e).__name__}: {e}"
-    if thinking:
-        if state["open"] or not tags:
-            yield reason("\n")
-        for piece in R.chunks(thinking):
-            yield reason(piece)
-            await asyncio.sleep(0.004)
-    if tags and state["open"]:
-        yield _delta_chunk(cid, created, raw_model, {"content": "\n</think>\n\n"})
-    for piece in R.chunks(answer):
-        yield _delta_chunk(cid, created, raw_model, {"content": piece})
-        await asyncio.sleep(0.004)
+        work = None
+        yield content(f"[Bridge Error] {type(e).__name__}: {e}")
+
+    if work is not None:
+        eff = effort if native else None
+        sp = R.Splitter(enabled=effort != "none")
+        got, streamed = False, False
+        if can_stream:
+            try:
+                agen = backend_stream(base, work, params, eff)
+                nxt = None
+                while True:
+                    if nxt is None:
+                        nxt = asyncio.ensure_future(_next(agen))
+                    done, _ = await asyncio.wait({nxt}, timeout=10)
+                    if not done:
+                        yield ": keepalive\n\n"
+                        continue
+                    item, nxt = nxt.result(), None
+                    if item is None:
+                        break
+                    kind, txt = item
+                    if kind == "error":
+                        raise RuntimeError(txt)
+                    got = True
+                    if kind == "reasoning":
+                        st["mr"] += txt
+                        yield reason(txt)
+                    else:
+                        for k, t in sp.feed(txt):
+                            st["mr"] += t if k == "r" else ""
+                            yield reason(t) if k == "r" else content(t)
+                for k, t in sp.finish():
+                    st["mr"] += t if k == "r" else ""
+                    yield reason(t) if k == "r" else content(t)
+                streamed = True
+            except Exception as e:
+                if got:
+                    yield content(f"\n\n[Bridge Error] {type(e).__name__}: {e}")
+                    streamed = True
+        if not streamed:
+            try:
+                text, thoughts = await call_full(base, work, params, eff)
+            except BackendError as e:
+                text, thoughts = f"[Bridge Error] {e}", ""
+            tag_r, answer = R.split_reasoning(text)
+            th = "" if effort == "none" else (thoughts or tag_r)
+            if th:
+                st["mr"] += th
+                for piece in R.chunks(th):
+                    yield reason(piece)
+                    await asyncio.sleep(0.004)
+            for piece in R.chunks(answer):
+                yield content(piece)
+                await asyncio.sleep(0.004)
+        if not st["answer"].strip() and st["mr"].strip():
+            yield content(st["mr"])  # model put everything inside the tags
+        if web and info:
+            foot = S.sources_footer(st["answer"], info)
+            if foot:
+                yield content(foot)
+    if tags and st["open"]:
+        st["open"] = False
+        yield chunk({"content": "\n</think>\n\n"})
     yield _delta_chunk(cid, created, raw_model, {}, finish="stop")
     if include_usage:
         p = sum(R.approx_tokens(S.tt(m.get("content", ""))) for m in msgs)
-        c = R.approx_tokens(answer + thinking)
+        c = R.approx_tokens(st["answer"] + st["mr"])
         yield ("data: " + json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created,
                                       "model": raw_model, "choices": [],
                                       "usage": {"prompt_tokens": p, "completion_tokens": c,
@@ -227,7 +374,7 @@ async def chat(req: Request, authorization: Optional[str] = Header(None)):
     raw_model = body.get("model") or DEFAULT_MODEL
     base, flags = R.parse_model(raw_model)
     web = "web" in flags
-    tags = "tags" in flags or REASONING_FORMAT == "tags"
+    tags = ("tags" in flags or REASONING_FORMAT == "tags") and "field" not in flags
     effort = R.resolve_effort(body, flags)
     msgs = body.get("messages", [])
     params = R.sampling_params(body)

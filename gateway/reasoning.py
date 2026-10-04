@@ -13,7 +13,7 @@ Request fields that are honoured too (so PocketPal's own toggles work):
 import re
 from typing import Optional
 
-FLAGS = ("web", "think", "nothink", "tags", "low", "medium", "high")
+FLAGS = ("web", "think", "nothink", "tags", "field", "low", "medium", "high")
 EFFORT_FLAGS = {"think": "medium", "low": "low", "medium": "medium", "high": "high", "nothink": "none"}
 EFFORTS = ("none", "minimal", "low", "medium", "high")
 OPEN_TAGS = ("think", "thinking", "reasoning", "thought")
@@ -154,3 +154,51 @@ def chunks(text: str, size: int = 28):
             buf = ""
     if buf:
         yield buf
+
+
+_TAGS = tuple(f"<{t}>" for t in OPEN_TAGS) + tuple(f"</{t}>" for t in OPEN_TAGS)
+
+
+def _could_be_tag(frag: str) -> bool:
+    f = frag.lower()
+    return any(t.startswith(f) for t in _TAGS)
+
+
+class Splitter:
+    """Incremental <think> splitter for streamed text. feed()/finish() return [(kind, text)], kind 'r' or 'c'.
+    Tags may arrive split across chunks; a possible partial tag is held back until it is resolved."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled, self.buf, self.inside, self.lstrip = enabled, "", False, False
+
+    def _out(self, out, kind, text):
+        if self.lstrip:
+            text = text.lstrip()
+        if text:
+            self.lstrip = False
+            out.append((kind, text))
+
+    def feed(self, s: str, final: bool = False) -> list:
+        if not self.enabled:
+            return [("c", s)] if s else []
+        self.buf += s
+        out = []
+        while True:
+            m = (_CLOSE if self.inside else _OPEN).search(self.buf)
+            if m:
+                self._out(out, "r" if self.inside else "c", self.buf[:m.start()])
+                self.buf = self.buf[m.end():]
+                self.inside, self.lstrip = not self.inside, True
+                continue
+            keep = 0
+            if not final:
+                i = self.buf.rfind("<")
+                if i != -1 and _could_be_tag(self.buf[i:]):
+                    keep = len(self.buf) - i
+            cut = len(self.buf) - keep
+            self._out(out, "r" if self.inside else "c", self.buf[:cut])
+            self.buf = self.buf[cut:]
+            return out
+
+    def finish(self) -> list:
+        return self.feed("", final=True)

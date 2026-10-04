@@ -42,6 +42,20 @@ def test_instruction_and_system_merge():
     assert out[0]["content"] == "S\n\nEXTRA" and len(out) == 2
 
 
+def test_stream_splitter():
+    def run(parts):
+        sp, out = R.Splitter(), []
+        for c in parts:
+            out += sp.feed(c)
+        return out + sp.finish()
+    o = run(["Hi <thi", "nk>abc ", "def</th", "ink>\n\nanswer 1 < 2 and <b>x</b>"])
+    assert o == [("c", "Hi "), ("r", "abc "), ("r", "def"), ("c", "answer 1 < 2 and <b>x</b>")], o
+    assert run(["plain text"]) == [("c", "plain text")]
+    assert run(["<think>cut", " off"]) == [("r", "cut"), ("r", " off")]
+    assert R.Splitter(enabled=False).feed("<think>x</think>") == [("c", "<think>x</think>")]
+    assert R.parse_model("a/b:think:field")[1] == {"think", "field"}
+
+
 def test_sampling_params():
     p = R.sampling_params({"temperature": 0.2, "max_completion_tokens": 50, "messages": [], "stream": True})
     assert p == {"temperature": 0.2, "max_tokens": 50}

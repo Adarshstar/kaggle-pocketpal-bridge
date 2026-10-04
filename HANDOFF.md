@@ -57,12 +57,23 @@ Thinking works by prompt: the gateway asks the model to reason inside `<think>` 
 `reasoning_content` (separate, shown by PocketPal in its thinking place IF its OpenAI client renders that field) and `content`.
 If PocketPal shows no thinking panel, use `:tags` (or set env REASONING_FORMAT=tags) so it parses `<think>` itself.
 UNVERIFIED: how the PocketPal build renders `reasoning_content` could not be tested from here; test both on the phone.
-Streaming is simulated (kbench has no token stream): the full reply is replayed in small SSE chunks, with keep-alives.
+Streaming: real token stream with bridge v3 (see 2c); older bridges fall back to a simulated stream.
 Search progress ("Planning search", "Searching: ...", "Read N pages") is streamed into the thinking field for `:web` models.
 Extra endpoints: `GET /v1/controls` (flag list), `GET /v1/backend-info` (Kaggle `prompt()` signature + llm attrs: use it to
 see which sampling params kbench really accepts), `GET /search?q=&recency=day|week|month|year|none&pages=1` (debug).
 Env knobs (GitHub workflow env or defaults): SEARCH_REWRITE=0 disables the LLM query planner (saves one small Kaggle call),
 SEARCH_MODEL, FETCH_PAGES, PAGE_CHARS, TOP_RESULTS, REASONING_FORMAT, BACKEND_TIMEOUT.
+
+## 2c. v3 (real streaming + native thinking) - see CHANGELOG.md 3.0
+- Bridge (kaggle/bridge.py v3) uses kaggle_benchmarks natively: `llm.prompt(reasoning=none|low|medium|high, extra_api_params=...)`,
+  thoughts from `kbench.chats.last_reasoning_traces()`, one fresh `kbench.chats.new()` per request, and real token streaming via
+  `llm.invoke()` with `stream_responses=True` (SSE `data: {"delta"|"reasoning"|"error"|"done"}` between bridge and gateway).
+  Source of truth for these APIs: `pip download kaggle-benchmarks` (public on PyPI; read actors/llms.py).
+- Gateway learns backend `caps` (["stream","native_reasoning"]) from /register or /v1/info; old notebooks (no caps) keep working
+  through the prompt-based thinking + simulated stream. THINK_MODE=native|prompt. Default REASONING_FORMAT=tags (PocketPal parses
+  `<think>` in content itself); `:field` flag = reasoning_content.
+- After deploying: run `gh workflow run kaggle-push.yml` so the notebook runs bridge v3, then check GET /health -> backend_caps.
+- Limit: kbench drops Gemini thought parts while streaming, so live thinking only streams for models whose proxy puts `<think>` in content.
 
 ## 3. Secrets (names only)
 GitHub repo Actions secrets: `NGROK_TOKEN` (ngrok authtoken), `BRIDGE_KEY` (shared key: PocketPal API key, gateway auth,

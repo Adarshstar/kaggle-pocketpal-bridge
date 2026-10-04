@@ -6,6 +6,7 @@ subprocess.run([sys.executable, "-m", "pip", "install", "-q", "fastapi", "uvicor
 import uvicorn, requests
 from typing import Any, List, Optional
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import kaggle_benchmarks as kbench
 
@@ -32,7 +33,8 @@ class P(BaseModel):
     model: Optional[str] = None
     messages: List[M]
     stream: Optional[bool] = False
-    params: Optional[dict] = None  # sampling params from the gateway (temperature, max_tokens, ...)
+    params: Optional[dict] = None
+    reasoning: Optional[str] = None  # sampling params from the gateway (temperature, max_tokens, ...)
 
 def tt(c):
     if isinstance(c, str):
@@ -51,26 +53,133 @@ def models(x_backend_key: Optional[str] = Header(None)):
     return {"object": "list",
             "data": [{"id": m, "object": "model"} for m in sorted(kbench.llms.keys())]}
 
-def accepted_params(llm, params):
-    """Only pass sampling params that llm.prompt() explicitly declares (never guess; unknown names are dropped)."""
-    if not params:
-        return {}
-    try:
-        sig = inspect.signature(llm.prompt).parameters
-    except (TypeError, ValueError):
-        return {}
-    return {k: v for k, v in params.items() if k in sig}
-
 def result_text(r):
-    """kbench may return a str or an object; if it exposes separate reasoning, wrap it in <think> tags."""
     if isinstance(r, str):
         return r
-    text = getattr(r, "text", None) or getattr(r, "content", None) or str(r)
-    for attr in ("reasoning", "reasoning_content", "thinking"):
-        t = getattr(r, attr, None)
-        if isinstance(t, str) and t.strip():
-            return "<think>\n" + t.strip() + "\n</think>\n\n" + str(text)
-    return str(text)
+    return str(getattr(r, "text", None) or getattr(r, "content", None) or r)
+
+CAPS = ["stream", "native_reasoning"]
+LEVELS = ("none", "low", "medium", "high")
+EXTRA_OK = ("max_tokens", "top_p", "stop", "presence_penalty", "frequency_penalty")
+
+def norm_effort(e):
+    if not e:
+        return None
+    e = str(e).lower()
+    e = "low" if e == "minimal" else e
+    return e if e in LEVELS else None
+
+def split_msgs(msgs):
+    system = "\n\n".join(tt(m.content) for m in msgs if m.role == "system") or None
+    rest = [m for m in msgs if m.role != "system"]
+    return system, rest
+
+def flat_prompt(rest):
+    if len(rest) == 1:
+        return tt(rest[0].content)
+    return "\n".join(f"{m.role}: {tt(m.content)}" for m in rest)
+
+def split_params(params):
+    p = dict(params or {})
+    seed = int(p.pop("seed", 0) or 0)
+    temp = p.pop("temperature", None)
+    extra = {k: v for k, v in p.items() if k in EXTRA_OK}
+    return seed, temp, extra
+
+def ladder(effort, extra):
+    """Attempts from richest to plainest; later ones run only if an earlier call raised."""
+    out = [(effort, extra)]
+    if extra:
+        out.append((effort, {}))
+    if effort:
+        out.append((None, {}))
+    return out
+
+def run_blocking(model, p):
+    llm = kbench.llms[model]
+    system, rest = split_msgs(p.messages)
+    seed, temp, extra = split_params(p.params)
+    effort = norm_effort(p.reasoning)
+    err = None
+    for eff, ex in ladder(effort, extra):
+        try:
+            kw = {"seed": seed}
+            if temp is not None:
+                kw["temperature"] = temp
+            if eff:
+                kw["reasoning"] = eff
+            if ex:
+                kw["extra_api_params"] = ex
+            with kbench.chats.new("req", system_instructions=system, orphan=True):
+                r = llm.prompt(flat_prompt(rest), **kw)
+                return result_text(r), kbench.chats.last_reasoning_traces()
+        except Exception as e:
+            err = e
+    raise err
+
+def sse(obj):
+    return "data: " + json.dumps(obj) + "\n\n"
+
+def stream_worker(model, p, q):
+    """Runs in a thread: pushes ('d', text) / ('r', thoughts) / ('e', msg) / ('x', None) into q."""
+    import copy
+    from kaggle_benchmarks import actors as kactors, messages as kmsgs
+    try:
+        llm0 = kbench.llms[model]
+        llm = copy.copy(llm0)
+        llm.stream_responses = True
+        system, rest = split_msgs(p.messages)
+        seed, temp, extra = split_params(p.params)
+        effort = norm_effort(p.reasoning)
+        msgs = [kmsgs.Message(sender=(kactors.user if m.role == "user" else llm0), content=tt(m.content))
+                for m in rest]
+        err, got = None, False
+        for eff, ex in ladder(effort, extra):
+            try:
+                kw = {"seed": seed, **ex}
+                if temp is not None and getattr(llm, "support_temperature", False):
+                    kw["temperature"] = temp
+                resp = llm.invoke(msgs, system=system, reasoning=eff, **kw)
+                if hasattr(resp, "__next__") or (hasattr(resp, "__iter__") and not hasattr(resp, "content")):
+                    for ch in resp:
+                        c = getattr(ch, "content", ch if isinstance(ch, str) else "") or ""
+                        if c:
+                            got = True
+                            q.put(("d", c))
+                else:
+                    t = getattr(resp, "reasoning_traces", None)
+                    if t:
+                        q.put(("r", t))
+                    c = getattr(resp, "content", "") or ""
+                    got = bool(c)
+                    q.put(("d", c))
+                err = None
+                break
+            except Exception as e:
+                err = e
+                if got:
+                    break
+        if err:
+            q.put(("e", f"{type(err).__name__}: {err}"))
+    except Exception as e:
+        q.put(("e", f"{type(e).__name__}: {e}"))
+    finally:
+        q.put(("x", None))
+
+def stream_gen(model, p):
+    import queue
+    q = queue.Queue()
+    threading.Thread(target=stream_worker, args=(model, p, q), daemon=True).start()
+    while True:
+        try:
+            kind, val = q.get(timeout=10)
+        except queue.Empty:
+            yield ": keepalive\n\n"
+            continue
+        if kind == "x":
+            yield sse({"done": True})
+            return
+        yield sse({{"d": "delta", "r": "reasoning", "e": "error"}[kind]: val})
 
 @app.get("/v1/info")
 def info(x_backend_key: Optional[str] = Header(None)):
@@ -80,7 +189,7 @@ def info(x_backend_key: Optional[str] = Header(None)):
         sig = str(inspect.signature(llm.prompt))
     except Exception as e:
         sig = f"unavailable: {e}"
-    return {"version": "2.0", "models": len(kbench.llms), "prompt_signature": sig,
+    return {"version": "3.0", "caps": CAPS, "models": len(kbench.llms), "prompt_signature": sig,
             "llm_type": type(llm).__name__,
             "llm_attrs": [a for a in dir(llm) if not a.startswith("_")][:60]}
 
@@ -88,20 +197,19 @@ def info(x_backend_key: Optional[str] = Header(None)):
 def chat(p: P, x_backend_key: Optional[str] = Header(None)):
     auth(x_backend_key)
     model = p.model if p.model in kbench.llms else DEFAULT
-    prompt = "\n".join(f"{m.role}: {tt(m.content)}" for m in p.messages)
+    if p.stream:
+        return StreamingResponse(stream_gen(model, p), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    thoughts = None
     try:
-        llm = kbench.llms[model]
-        extra = accepted_params(llm, p.params)
-        try:
-            r = llm.prompt(prompt, **extra) if extra else llm.prompt(prompt)
-        except TypeError:
-            r = llm.prompt(prompt)
-        text = result_text(r)
+        text, thoughts = run_blocking(model, p)
     except Exception as e:
         text = f"[Proxy Error] {model}: {e}"
+    msg = {"role": "assistant", "content": text}
+    if thoughts:
+        msg["reasoning_content"] = thoughts
     return {"id": "c1", "object": "chat.completion", "created": int(time.time()), "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                         "finish_reason": "stop"}]}
+            "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}]}
 
 def serve():
     loop = asyncio.new_event_loop()
@@ -132,7 +240,7 @@ threading.Thread(target=lambda: [None for _ in proc.stdout], daemon=True).start(
 def heartbeat():
     while True:
         try:
-            requests.post(GATEWAY + "/register", json={"url": tunnel}, timeout=10,
+            requests.post(GATEWAY + "/register", json={"url": tunnel, "caps": CAPS, "v": "3.0"}, timeout=10,
                           headers={"Authorization": f"Bearer {KEY}", "ngrok-skip-browser-warning": "1"})
         except Exception as e:
             print("register failed:", e)
