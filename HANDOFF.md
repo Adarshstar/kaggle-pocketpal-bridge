@@ -73,7 +73,7 @@ SEARCH_MODEL, FETCH_PAGES, PAGE_CHARS, TOP_RESULTS, REASONING_FORMAT, BACKEND_TI
   through the prompt-based thinking + simulated stream. THINK_MODE=native|prompt. Default REASONING_FORMAT=tags (PocketPal parses
   `<think>` in content itself); `:field` flag = reasoning_content.
 - After deploying: run `gh workflow run kaggle-push.yml` so the notebook runs bridge v3, then check GET /health -> backend_caps.
-- Limit: kbench drops Gemini thought parts while streaming, so live thinking only streams for models whose proxy puts `<think>` in content.
+- Verified live (2026-10-04, bridge v3): gemini-2.5-flash `:think` non-stream -> clean answer + reasoning_content; stream -> live thoughts inside <think>, then answer; `:web` stream OK. Not yet tested live: Claude, DeepSeek-R1, Qwen, PocketPal rendering.
 
 ## 3. Secrets (names only)
 GitHub repo Actions secrets: `NGROK_TOKEN` (ngrok authtoken), `BRIDGE_KEY` (shared key: PocketPal API key, gateway auth,

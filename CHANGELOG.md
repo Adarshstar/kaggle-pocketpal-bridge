@@ -12,8 +12,9 @@
 - PocketPal: default REASONING_FORMAT is now `tags` (`<think>..</think>` in content, which PocketPal parses itself);
   add `:field` to a model id for `reasoning_content` instead.
 - Tests: tests/test_bridge.py runs the bridge against the real kaggle_benchmarks package with a fake LLM.
-- Known kbench limit: while streaming, Gemini thought parts are dropped by the library, so streamed thinking only appears for
-  models whose proxy embeds `<think>` in content; use a non-stream (`:think` on a gateway without caps) for others.
+- Verified live 2026-10-04: gemini-2.5-flash `:think` returns clean answer + separate thoughts (non-stream) and streams
+  thoughts live inside `<think>` (the proxy embeds the tags); `:web` streams search progress, answer and Sources.
+  kbench's own streaming path does not capture thoughts into `last_reasoning_traces()`, but the gateway parses the tags.
 
 ## 2.0 - native PocketPal controls, streaming, search v2 (branch feat/native-controls)
 - Thinking/reasoning controls. Model-id flags `:think :low :medium :high :nothink :tags`, plus request fields
