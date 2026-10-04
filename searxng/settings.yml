@@ -18,3 +18,17 @@ outgoing:
   request_timeout: 5.0
   max_request_timeout: 10.0
   pool_connections: 50
+
+# Engines that are always blocked / rate limited from GitHub runner IPs (seen in /search debug): disable them so they
+# do not waste the request timeout. Search v2 also uses ddgs (text + news) directly, see gateway/search.py.
+engines:
+  - name: duckduckgo
+    disabled: true
+  - name: brave
+    disabled: true
+  - name: brave.news
+    disabled: true
+  - name: google news
+    disabled: true
+  - name: reuters
+    disabled: true

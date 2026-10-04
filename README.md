@@ -36,3 +36,9 @@ with today's date and [n] citation numbers.
   public repos are unlimited.
 - Replies arrive all at once. Each message uses Kaggle quota (about $10/day, $100/month).
 - Regenerate tokens that were pasted into chats.
+
+## v2: thinking controls, streaming, search v2
+Flags on any model id: `:web` search, `:think` / `:low` / `:medium` / `:high` thinking effort, `:nothink`, `:tags`.
+E.g. `google/gemini-2.5-pro:web:high`. Thinking (and search progress) is streamed in `reasoning_content`, separate from the
+answer; use `:tags` if PocketPal does not show it. Details: HANDOFF.md section 2b, CHANGELOG.md.
+Deploy: `gh workflow run live.yml -f mode=live`; after changing kaggle/bridge.py run `gh workflow run kaggle-push.yml`.

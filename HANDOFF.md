@@ -46,6 +46,24 @@ to be re-entered in PocketPal when a tunnel restarts.
 - `.github/workflows/live.yml`  workflow_dispatch with input `mode`: `test` (checks only, no tunnel) or `live` (publish on ngrok).
   concurrency group `run-<mode>`, cancel-in-progress false, so a queued run waits for the running one.
 
+## 2b. v2 features (PocketPal native controls) - see CHANGELOG.md
+Model id flags (suffixes, any order; any model id works with them): `:web` live search, `:think` (medium),
+`:low` `:medium` `:high` thinking effort, `:nothink`, `:tags` (thinking as `<think>` in content).
+Example: `google/gemini-2.5-pro:web:high`. The model list shows curated `:web`, `:web:think`, `:think` ids first.
+Request fields honoured (so PocketPal's own toggles work if it sends them): `reasoning_effort`, `reasoning.effort`,
+`thinking{type,budget_tokens}`, `enable_thinking`, `chat_template_kwargs.enable_thinking`, temperature, top_p,
+max_tokens, stop, seed, `stream`, `stream_options.include_usage`. Suffix flags win over request fields.
+Thinking works by prompt: the gateway asks the model to reason inside `<think>` tags, then splits the reply into
+`reasoning_content` (separate, shown by PocketPal in its thinking place IF its OpenAI client renders that field) and `content`.
+If PocketPal shows no thinking panel, use `:tags` (or set env REASONING_FORMAT=tags) so it parses `<think>` itself.
+UNVERIFIED: how the PocketPal build renders `reasoning_content` could not be tested from here; test both on the phone.
+Streaming is simulated (kbench has no token stream): the full reply is replayed in small SSE chunks, with keep-alives.
+Search progress ("Planning search", "Searching: ...", "Read N pages") is streamed into the thinking field for `:web` models.
+Extra endpoints: `GET /v1/controls` (flag list), `GET /v1/backend-info` (Kaggle `prompt()` signature + llm attrs: use it to
+see which sampling params kbench really accepts), `GET /search?q=&recency=day|week|month|year|none&pages=1` (debug).
+Env knobs (GitHub workflow env or defaults): SEARCH_REWRITE=0 disables the LLM query planner (saves one small Kaggle call),
+SEARCH_MODEL, FETCH_PAGES, PAGE_CHARS, TOP_RESULTS, REASONING_FORMAT, BACKEND_TIMEOUT.
+
 ## 3. Secrets (names only)
 GitHub repo Actions secrets: `NGROK_TOKEN` (ngrok authtoken), `BRIDGE_KEY` (shared key: PocketPal API key, gateway auth,
 notebook->gateway registration, gateway->notebook header `X-Backend-Key`), `KAGGLE_API_TOKEN` (Kaggle CLI token, KGAT_...).
@@ -67,7 +85,14 @@ Tools used so far: GitHub CLI `gh` (through a "Server MCP" connector that is aut
 - Kaggle CLI: `python3 -m venv /tmp/kv && /tmp/kv/bin/pip install kaggle`, then `export KAGGLE_API_TOKEN=<token>`;
   `kaggle kernels list --mine`; `kaggle kernels pull adarshstar/new-benchmark-task-68ca6 -p dir -m`;
   edit the .ipynb; `kaggle kernels push -p dir`. `kaggle kernels status` returned HTTP 404 (API quirk), so verify via gateway /health.
-- Re-pushing the notebook: take `kaggle/bridge.py`, prepend `import os; os.environ.setdefault("BRIDGE_KEY","<key>")`,
+- Re-push the notebook from Actions: `gh workflow run kaggle-push.yml` (uses secrets KAGGLE_API_TOKEN + BRIDGE_KEY, runs
+`scripts/kaggle_push.py`). Needed after any change to kaggle/bridge.py; it restarts the backend (brief outage).
+- Local checks: `PYTHONPATH=. python tests/test_units.py` and `PYTHONPATH=. python scripts/dev_e2e.py`.
+- Dev workflow used for v2: branch `feat/native-controls` -> `gh workflow run live.yml --ref feat/native-controls -f mode=test`
+  -> merge to main -> `gh workflow run live.yml -f mode=live` (cancel the old run first) -> kaggle-push if bridge.py changed.
+- Pitfall: never `pkill -f <pattern>` in the MCP terminal (it kills the session shell); backgrounding servers from it hangs
+  the connector, so run servers from a Python script that Popen()s them (see scripts/dev_e2e.py).
+- Re-pushing the notebook by hand: take `kaggle/bridge.py`, prepend `import os; os.environ.setdefault("BRIDGE_KEY","<key>")`,
   append `while True: time.sleep(3600)` (keeps the Kaggle run alive), put it as the single code cell, push.
 - Kaggle notebooks of the user: `adarshstar/new-benchmark-task-68ca6` (standard image, internet on, runs the bridge) and
   `adarshstar/new-benchmark-task-5d166` (uses the special `personal-benchmarks-new` docker image; its .ipynb pulled as non-JSON).
@@ -98,19 +123,26 @@ use big models (Opus, GPT-6, Pro) sparingly because of the quota.
    second source, `/search` exposes `debug`. After the fix "latest Python version" correctly returned 3.14.x.
 4. The user's Kaggle API token was used to push the bridge into notebook 68ca6 (replacing the old ngrok cell).
 
+## 7b. v2 history
+5. User asked for PocketPal-native controls (reasoning/thinking, thinking shown separately), better search, all built in
+   the repo first and deployed via Actions. Done on branch feat/native-controls, see CHANGELOG.md for details.
+6. Bug found while testing: parsing several pages in parallel threads crashed the gateway natively
+   (`free(): invalid pointer`, lxml/trafilatura) -> single extraction thread.
+
 ## 8. Known issues / limits
 - GitHub Actions: 6 h per job. run_tunnel.py queues a successor ~10 min before the end; expect a 1-2 min gap. Free private-repo
   quota is 2000 min/month (about 33 h). A public repo has unlimited minutes (no secrets are stored in the repo).
 - Kaggle notebook runs have a session time limit; when it ends `/health` shows backend_connected:false. Fix: re-push the notebook.
 - Search runs from datacenter IPs: DuckDuckGo/Brave/Google News blocked, quality varies between queries. Ideas: add engines in
   searxng/settings.yml, a free API search (Tavily/Brave API keys as GitHub secrets), better query rewriting with an LLM call.
-- Replies are not streamed (full answer arrives at once).
+- Streaming is simulated (full answer replayed in chunks); kbench gives no token stream. Thinking is prompt-based, so
+  models that ignore the `<think>` instruction just show no thinking. Planner costs one small Kaggle call per `:web` message.
 - Old notebook sessions that still hold the ngrok pool (pooling_enabled) can steal requests; make sure no old cell is running.
 - If ngrok complains about simultaneous sessions, make sure only one agent (the Actions job) uses NGROK_TOKEN.
 - The gateway keeps the backend URL in memory only; it relearns it from the 15 s heartbeat after a restart.
 
 ## 9. Ideas for next work
-- Real streaming (SSE chunks) from the Kaggle side.
+- True token streaming if kaggle_benchmarks ever exposes it (check GET /v1/backend-info).
 - Smarter search: LLM query rewriting, `time_range`, more engines, source-quality ranking, caching, page-fetch timeouts.
 - Auto re-launch of the Kaggle notebook (scheduled `kaggle kernels push` from a GitHub Action using KAGGLE_API_TOKEN).
 - Quota guard: count requests and warn/limit expensive models.

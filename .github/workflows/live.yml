@@ -33,6 +33,10 @@ jobs:
           python-version: "3.12"
       - name: Install gateway deps
         run: pip install -r gateway/requirements.txt
+      - name: Unit tests (offline, both modes)
+        run: python tests/test_units.py
+        env:
+          PYTHONPATH: .
       - name: Start SearXNG
         run: bash scripts/start_searxng.sh
       - name: Start gateway

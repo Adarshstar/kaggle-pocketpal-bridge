@@ -1,34 +1,36 @@
-"""OpenAI-compatible gateway with web search (SearXNG) in front of the Kaggle backend.
+"""OpenAI-compatible gateway in front of the Kaggle backend (v2).
 
-PocketPal -> (ngrok) -> this gateway -> [SearXNG search + page extraction] -> Kaggle backend (LLM)
+PocketPal -> (ngrok) -> this gateway -> [web search v2] -> Kaggle backend (LLM)
 
-- Model ids ending in ":web" get web search context injected; plain ids go straight through.
+- Model id flags: ":web" (live search), ":think/:low/:medium/:high/:nothink" (thinking), ":tags" (<think> in content).
+  See gateway/reasoning.py. Request fields reasoning_effort / thinking / enable_thinking are honoured too.
+- Thinking is streamed in `delta.reasoning_content` (separate from the answer); search progress goes there too.
+- Replies are streamed in small SSE chunks with keep-alives while the Kaggle model works.
 - The Kaggle notebook registers its tunnel URL via POST /register (heartbeat).
 """
-import os, re, json, time, asyncio, datetime
-from typing import Any, Optional
-from urllib.parse import urlparse
+import os, json, time, asyncio, uuid
+from typing import Optional
 
 import httpx
-import trafilatura
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-SEARX = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888").rstrip("/")
+from . import reasoning as R
+from . import search as S
+
+VERSION = "2.0"
 KEY = os.environ.get("BRIDGE_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "google/gemini-2.5-flash")
+REASONING_FORMAT = os.environ.get("REASONING_FORMAT", "field")  # field | tags
 WEB_MODELS = [m for m in os.environ.get(
     "WEB_MODELS",
     "google/gemini-2.5-flash,google/gemini-2.5-pro,anthropic/claude-sonnet-5@default,"
     "openai/gpt-5.4-mini-2026-03-17,deepseek-ai/deepseek-r1-0528,qwen/qwen3-235b-a22b-instruct-2507",
 ).split(",") if m]
-TOP_RESULTS = int(os.environ.get("TOP_RESULTS", "8"))
-FETCH_PAGES = int(os.environ.get("FETCH_PAGES", "3"))
-PAGE_CHARS = int(os.environ.get("PAGE_CHARS", "1800"))
-UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+BACKEND_TIMEOUT = int(os.environ.get("BACKEND_TIMEOUT", "300"))
 
 backend = {"url": os.environ.get("BACKEND_URL", "").rstrip("/"), "seen": 0.0}
-app = FastAPI(title="kaggle-pocketpal-gateway")
+app = FastAPI(title="kaggle-pocketpal-gateway", version=VERSION)
 
 
 def check(authorization: Optional[str]):
@@ -36,132 +38,58 @@ def check(authorization: Optional[str]):
         raise HTTPException(status_code=401, detail="invalid api key")
 
 
-def tt(c: Any) -> str:
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
-    return str(c)
+class BackendError(Exception):
+    pass
 
 
-def make_query(msgs: list) -> str:
-    users = [tt(m.get("content", "")).strip() for m in msgs if m.get("role") == "user"]
-    users = [u for u in users if u]
-    if not users:
-        return ""
-    q = users[-1]
-    # short follow-ups ("and in 2020?") need the previous question for context
-    if len(q) < 40 and len(users) > 1:
-        q = users[-2][-200:] + " " + q
-    return re.sub(r"\s+", " ", q)[-300:]
-
-
-LAST = {"unresponsive": [], "searx": 0, "ddgs": 0, "ddgs_error": ""}
-
-
-def ddgs_search(q: str) -> list:
-    try:
-        try:
-            from ddgs import DDGS
-        except ImportError:
-            from duckduckgo_search import DDGS
-        rows = DDGS().text(q, max_results=10) or []
-        LAST["ddgs_error"] = ""
-        return [{"title": x.get("title", ""), "url": x.get("href") or x.get("url", ""),
-                 "content": x.get("body", ""), "engines": ["ddgs"]} for x in rows]
-    except Exception as e:
-        LAST["ddgs_error"] = f"{type(e).__name__}: {e}"[:200]
-        return []
-
-
-async def searx(client: httpx.AsyncClient, q: str) -> list:
-    raw = []
-    try:
-        r = await client.get(f"{SEARX}/search", params={
-            "q": q, "format": "json", "language": "auto", "categories": "general,news"}, timeout=20)
-        r.raise_for_status()
-        j = r.json()
-        raw = j.get("results", [])
-        LAST["unresponsive"] = j.get("unresponsive_engines", [])
-    except Exception as e:
-        LAST["unresponsive"] = [["searxng", str(e)[:100]]]
-    web = await asyncio.to_thread(ddgs_search, q)
-    LAST["searx"], LAST["ddgs"] = len(raw), len(web)
-
-    def is_news(x):
-        return bool(x.get("engines")) and all("news" in e for e in x["engines"])
-
-    raw = web + [x for x in raw if not is_news(x)] + [x for x in raw if is_news(x)]
-    seen, out = set(), []
-    for x in raw:
-        u = x.get("url", "")
-        p = urlparse(u)
-        k = (p.netloc.lower().removeprefix("www."), p.path.rstrip("/"))
-        if not u or k in seen:
-            continue
-        seen.add(k)
-        out.append({"title": x.get("title", ""), "url": u,
-                    "snippet": (x.get("content") or "").strip(),
-                    "engines": x.get("engines", [])})
-        if len(out) >= TOP_RESULTS:
-            break
-    return out
-
-
-async def extract(client: httpx.AsyncClient, url: str) -> str:
-    try:
-        r = await client.get(url, headers={"User-Agent": UA}, timeout=8, follow_redirects=True)
-        if "text/html" not in r.headers.get("content-type", "text/html"):
-            return ""
-        text = await asyncio.to_thread(trafilatura.extract, r.text, include_comments=False,
-                                       include_tables=False)
-        return (text or "")[:PAGE_CHARS]
-    except Exception:
-        return ""
-
-
-async def web_context(msgs: list) -> str:
-    q = make_query(msgs)
-    today = datetime.datetime.utcnow().strftime("%A, %d %B %Y")
-    if not q:
-        return f"Current date: {today}."
-    async with httpx.AsyncClient() as client:
-        try:
-            results = await searx(client, q)
-        except Exception as e:
-            return f"Current date: {today}. Web search failed ({e}); answer from your own knowledge and say it may be outdated."
-        pages = await asyncio.gather(*[extract(client, r["url"]) for r in results[:FETCH_PAGES]])
-    lines = [f"Current date: {today} (UTC). Live web search results for: {q}", ""]
-    for i, r in enumerate(results, 1):
-        lines.append(f"[{i}] {r['title']} - {r['url']}")
-        if r["snippet"]:
-            lines.append(f"    {r['snippet']}")
-        if i <= len(pages) and pages[i - 1]:
-            lines.append(f"    Page excerpt: {pages[i - 1]}")
-        lines.append("")
-    lines.append("Use these results to answer with up-to-date facts. Cite sources like [1]. "
-                 "If the results are irrelevant or empty, say so instead of guessing.")
-    return "\n".join(lines)
-
-
-async def ask_backend(model: str, msgs: list) -> str:
+async def call_backend(model: str, msgs: list, params: Optional[dict] = None) -> str:
+    """Raises BackendError when the Kaggle notebook is missing/unreachable."""
     if not backend["url"]:
-        return "[Bridge] The Kaggle notebook is not connected. Run the bridge cell in your notebook."
+        raise BackendError("The Kaggle notebook is not connected. Run the bridge cell in your notebook.")
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"{backend['url']}/v1/chat/completions",
-                json={"model": model, "messages": msgs, "stream": False},
-                headers={"X-Backend-Key": KEY, "User-Agent": "gateway"}, timeout=300)
+                json={"model": model, "messages": msgs, "stream": False, "params": params or {}},
+                headers={"X-Backend-Key": KEY, "User-Agent": "gateway"}, timeout=BACKEND_TIMEOUT)
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"[Bridge Error] backend unreachable ({type(e).__name__}: {e}). Re-run the notebook cell."
+        raise BackendError(f"backend unreachable ({type(e).__name__}: {e}). Re-run the notebook cell.")
+
+
+async def ask_text(model: str, msgs: list, params: Optional[dict] = None) -> str:
+    """Like call_backend but turns failures into a readable reply."""
+    try:
+        return await call_backend(model, msgs, params)
+    except BackendError as e:
+        return f"[Bridge Error] {e}"
+
+
+async def pipeline(base: str, msgs: list, web: bool, effort: Optional[str], params: dict, progress):
+    """Search (optional) -> thinking instruction -> backend -> split. Returns (reasoning, answer, info)."""
+    work, info = msgs, None
+    if web:
+        ctx, info = await S.build_context(msgs, ask=call_backend, progress=progress)
+        work = [{"role": "system", "content": ctx}] + msgs
+    work = R.with_instruction(work, R.thinking_instruction(effort))
+    thinking_on = effort not in (None, "none")
+    if web or thinking_on:  # plain chats stay silent: no thinking panel at all
+        progress("Asking the model" + (f" (thinking: {effort})" if thinking_on else ""))
+    text = await ask_text(base, work, params)
+    reasoning, answer = R.split_reasoning(text)
+    if effort == "none":
+        reasoning = ""
+    if not answer and reasoning:  # model put everything inside the tags
+        answer, reasoning = reasoning, ""
+    if web and info:
+        answer += S.sources_footer(answer, info)
+    return reasoning, answer, info
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "backend_connected": bool(backend["url"]),
+    return {"ok": True, "version": VERSION, "backend_connected": bool(backend["url"]),
             "backend_last_seen_s": round(time.time() - backend["seen"]) if backend["seen"] else None}
 
 
@@ -176,11 +104,39 @@ async def register(req: Request, authorization: Optional[str] = Header(None)):
 
 
 @app.get("/search")
-async def search(q: str, authorization: Optional[str] = Header(None)):
+async def search(q: str, recency: str = "none", pages: int = 0, authorization: Optional[str] = Header(None)):
+    """Debug endpoint: raw ranked results (pages=1 also reads the top pages)."""
     check(authorization)
     async with httpx.AsyncClient() as client:
-        res = await searx(client, q)
-    return {"query": q, "results": res, "debug": LAST}
+        res = await S.search(client, [q], recency)
+        if pages:
+            txt = await asyncio.gather(*[S.page_text(client, r["url"]) for r in res[:S.FETCH_PAGES]])
+            for r, t in zip(res, txt):
+                r["excerpt"] = S.best_passages(t, q, S.PAGE_CHARS) if t else ""
+    return {"query": q, "recency": recency, "results": res, "debug": S.DEBUG}
+
+
+@app.get("/v1/controls")
+async def controls(authorization: Optional[str] = Header(None)):
+    check(authorization)
+    return {"version": VERSION, "reasoning_format": REASONING_FORMAT,
+            "model_flags": {"web": "live web search", "think": "thinking, medium", "low": "thinking, brief",
+                            "medium": "thinking, step by step", "high": "thinking, deep", "nothink": "no thinking",
+                            "tags": "send thinking inside <think> tags in content instead of reasoning_content"},
+            "request_fields": ["reasoning_effort", "reasoning.effort", "thinking.type/budget_tokens",
+                               "enable_thinking", "chat_template_kwargs.enable_thinking", "temperature", "top_p",
+                               "max_tokens", "stop", "seed", "stream", "stream_options.include_usage"]}
+
+
+@app.get("/v1/backend-info")
+async def backend_info(authorization: Optional[str] = Header(None)):
+    """What the Kaggle side supports (prompt() signature etc.); useful for the next agent."""
+    check(authorization)
+    if not backend["url"]:
+        raise HTTPException(503, "backend not connected")
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{backend['url']}/v1/info", headers={"X-Backend-Key": KEY}, timeout=15)
+        return JSONResponse(r.json(), status_code=r.status_code)
 
 
 @app.get("/v1/models")
@@ -190,37 +146,107 @@ async def models(authorization: Optional[str] = Header(None)):
     if backend["url"]:
         try:
             async with httpx.AsyncClient() as client:
-                r = await client.get(f"{backend['url']}/v1/models",
-                                     headers={"X-Backend-Key": KEY}, timeout=15)
+                r = await client.get(f"{backend['url']}/v1/models", headers={"X-Backend-Key": KEY}, timeout=15)
                 ids = [m["id"] for m in r.json().get("data", [])]
         except Exception:
             pass
-    web = [f"{m}:web" for m in WEB_MODELS if not ids or m in ids]
-    return {"object": "list", "data": [{"id": m, "object": "model"} for m in web + ids]}
+    ok = [m for m in WEB_MODELS if not ids or m in ids]
+    curated = []
+    for m in ok:
+        curated += [f"{m}:web", f"{m}:web:think"]
+    curated += [f"{m}:think" for m in ok[:4]]
+    return {"object": "list", "data": [{"id": m, "object": "model"} for m in curated + ids]}
+
+
+def _delta_chunk(cid, created, model, delta, finish=None):
+    c = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+    return "data: " + json.dumps(c) + "\n\n"
+
+
+async def stream_response(raw_model, base, msgs, web, effort, params, tags, include_usage):
+    cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
+    q: asyncio.Queue = asyncio.Queue()
+    task = asyncio.create_task(pipeline(base, msgs, web, effort, params, lambda s: q.put_nowait(s)))
+    state = {"open": False}
+
+    def reason(text):  # one piece of thinking text, in the configured format
+        if tags:
+            pre = "" if state["open"] else "<think>\n"
+            state["open"] = True
+            return _delta_chunk(cid, created, raw_model, {"content": pre + text})
+        return _delta_chunk(cid, created, raw_model, {"reasoning_content": text})
+
+    yield _delta_chunk(cid, created, raw_model, {"role": "assistant", "content": ""})
+    getter = None
+    while True:
+        if getter is None:
+            getter = asyncio.ensure_future(q.get())
+        done, _ = await asyncio.wait({getter, task}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+        if getter in done:
+            yield reason("- " + getter.result() + "\n")
+            getter = None
+            continue
+        if task in done:
+            break
+        yield ": keepalive\n\n"
+    if getter is not None and not getter.done():
+        getter.cancel()
+    while not q.empty():
+        yield reason("- " + q.get_nowait() + "\n")
+    try:
+        thinking, answer, _ = task.result()
+    except Exception as e:
+        thinking, answer = "", f"[Bridge Error] {type(e).__name__}: {e}"
+    if thinking:
+        if state["open"] or not tags:
+            yield reason("\n")
+        for piece in R.chunks(thinking):
+            yield reason(piece)
+            await asyncio.sleep(0.004)
+    if tags and state["open"]:
+        yield _delta_chunk(cid, created, raw_model, {"content": "\n</think>\n\n"})
+    for piece in R.chunks(answer):
+        yield _delta_chunk(cid, created, raw_model, {"content": piece})
+        await asyncio.sleep(0.004)
+    yield _delta_chunk(cid, created, raw_model, {}, finish="stop")
+    if include_usage:
+        p = sum(R.approx_tokens(S.tt(m.get("content", ""))) for m in msgs)
+        c = R.approx_tokens(answer + thinking)
+        yield ("data: " + json.dumps({"id": cid, "object": "chat.completion.chunk", "created": created,
+                                      "model": raw_model, "choices": [],
+                                      "usage": {"prompt_tokens": p, "completion_tokens": c,
+                                                "total_tokens": p + c}}) + "\n\n")
+    yield "data: [DONE]\n\n"
 
 
 @app.post("/v1/chat/completions")
 async def chat(req: Request, authorization: Optional[str] = Header(None)):
     check(authorization)
     body = await req.json()
-    model = body.get("model") or DEFAULT_MODEL
-    web = model.endswith(":web")
-    base = model[:-4] if web else model
+    raw_model = body.get("model") or DEFAULT_MODEL
+    base, flags = R.parse_model(raw_model)
+    web = "web" in flags
+    tags = "tags" in flags or REASONING_FORMAT == "tags"
+    effort = R.resolve_effort(body, flags)
     msgs = body.get("messages", [])
-    if web:
-        msgs = [{"role": "system", "content": await web_context(msgs)}] + msgs
-    text = await ask_backend(base, msgs)
-    ts = int(time.time())
+    params = R.sampling_params(body)
     if body.get("stream"):
-        def gen():
-            a = {"id": "c1", "object": "chat.completion.chunk", "created": ts, "model": model,
-                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]}
-            b = {"id": "c1", "object": "chat.completion.chunk", "created": ts, "model": model,
-                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-            yield "data: " + json.dumps(a) + "\n\n"
-            yield "data: " + json.dumps(b) + "\n\n"
-            yield "data: [DONE]\n\n"
-        return StreamingResponse(gen(), media_type="text/event-stream")
-    return JSONResponse({"id": "c1", "object": "chat.completion", "created": ts, "model": model,
-                         "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                                      "finish_reason": "stop"}]})
+        inc = bool((body.get("stream_options") or {}).get("include_usage"))
+        return StreamingResponse(
+            stream_response(raw_model, base, msgs, web, effort, params, tags, inc),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    thinking, answer, _ = await pipeline(base, msgs, web, effort, params, lambda s: None)
+    msg = {"role": "assistant", "content": answer}
+    if thinking:
+        if tags:
+            msg["content"] = f"<think>\n{thinking}\n</think>\n\n{answer}"
+        else:
+            msg["reasoning_content"] = thinking
+    p = sum(R.approx_tokens(S.tt(m.get("content", ""))) for m in msgs)
+    c = R.approx_tokens(answer + thinking)
+    return JSONResponse({"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion",
+                         "created": int(time.time()), "model": raw_model,
+                         "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
+                         "usage": {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}})

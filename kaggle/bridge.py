@@ -1,7 +1,7 @@
 # Kaggle backend cell: runs the LLM server and registers itself with the GitHub-Actions gateway.
 # Kaggle Secrets needed (Add-ons -> Secrets): BRIDGE_KEY   (same value as the GitHub secret BRIDGE_KEY)
 # STOP any old cell that used ngrok before running this one (the gateway owns the ngrok domain now).
-import os, re, json, time, asyncio, threading, subprocess, sys, stat, urllib.request
+import os, re, json, time, asyncio, threading, subprocess, sys, stat, urllib.request, inspect
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "fastapi", "uvicorn", "requests"], check=True)
 import uvicorn, requests
 from typing import Any, List, Optional
@@ -32,6 +32,7 @@ class P(BaseModel):
     model: Optional[str] = None
     messages: List[M]
     stream: Optional[bool] = False
+    params: Optional[dict] = None  # sampling params from the gateway (temperature, max_tokens, ...)
 
 def tt(c):
     if isinstance(c, str):
@@ -50,14 +51,52 @@ def models(x_backend_key: Optional[str] = Header(None)):
     return {"object": "list",
             "data": [{"id": m, "object": "model"} for m in sorted(kbench.llms.keys())]}
 
+def accepted_params(llm, params):
+    """Only pass sampling params that llm.prompt() explicitly declares (never guess; unknown names are dropped)."""
+    if not params:
+        return {}
+    try:
+        sig = inspect.signature(llm.prompt).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {k: v for k, v in params.items() if k in sig}
+
+def result_text(r):
+    """kbench may return a str or an object; if it exposes separate reasoning, wrap it in <think> tags."""
+    if isinstance(r, str):
+        return r
+    text = getattr(r, "text", None) or getattr(r, "content", None) or str(r)
+    for attr in ("reasoning", "reasoning_content", "thinking"):
+        t = getattr(r, attr, None)
+        if isinstance(t, str) and t.strip():
+            return "<think>\n" + t.strip() + "\n</think>\n\n" + str(text)
+    return str(text)
+
+@app.get("/v1/info")
+def info(x_backend_key: Optional[str] = Header(None)):
+    auth(x_backend_key)
+    llm = kbench.llms[DEFAULT]
+    try:
+        sig = str(inspect.signature(llm.prompt))
+    except Exception as e:
+        sig = f"unavailable: {e}"
+    return {"version": "2.0", "models": len(kbench.llms), "prompt_signature": sig,
+            "llm_type": type(llm).__name__,
+            "llm_attrs": [a for a in dir(llm) if not a.startswith("_")][:60]}
+
 @app.post("/v1/chat/completions")
 def chat(p: P, x_backend_key: Optional[str] = Header(None)):
     auth(x_backend_key)
     model = p.model if p.model in kbench.llms else DEFAULT
     prompt = "\n".join(f"{m.role}: {tt(m.content)}" for m in p.messages)
     try:
-        r = kbench.llms[model].prompt(prompt)
-        text = r if isinstance(r, str) else getattr(r, "text", str(r))
+        llm = kbench.llms[model]
+        extra = accepted_params(llm, p.params)
+        try:
+            r = llm.prompt(prompt, **extra) if extra else llm.prompt(prompt)
+        except TypeError:
+            r = llm.prompt(prompt)
+        text = result_text(r)
     except Exception as e:
         text = f"[Proxy Error] {model}: {e}"
     return {"id": "c1", "object": "chat.completion", "created": int(time.time()), "model": model,
