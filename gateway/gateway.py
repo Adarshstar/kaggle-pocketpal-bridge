@@ -2,7 +2,7 @@
 
 PocketPal -> (ngrok) -> this gateway -> [web search v2] -> Kaggle backend (LLM)
 
-- Model id flags: ":web" (live search), ":think/:low/:medium/:high/:nothink" (thinking), ":tags" (<think> in content).
+- Model id flags: ":shell" (model may run commands on the Render server, see shell_agent.py), ":web" (live search), ":think/:low/:medium/:high/:nothink" (thinking), ":tags" (<think> in content).
   See gateway/reasoning.py. Request fields reasoning_effort / thinking / enable_thinking are honoured too.
 - Thinking is streamed in `delta.reasoning_content` (separate from the answer); search progress goes there too.
 - Replies are streamed in small SSE chunks with keep-alives while the Kaggle model works.
@@ -17,8 +17,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import reasoning as R
 from . import search as S
+from . import shell_agent as SH
 
-VERSION = "3.0"
+VERSION = "3.1"
 KEY = os.environ.get("BRIDGE_KEY", "")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "google/gemini-2.5-flash")
 REASONING_FORMAT = os.environ.get("REASONING_FORMAT", "tags")  # field | tags
@@ -199,7 +200,7 @@ async def search(q: str, recency: str = "none", pages: int = 0, authorization: O
 async def controls(authorization: Optional[str] = Header(None)):
     check(authorization)
     return {"version": VERSION, "reasoning_format": REASONING_FORMAT,
-            "model_flags": {"web": "live web search", "think": "thinking, medium", "low": "thinking, brief",
+            "model_flags": {"web": "live web search", "shell": "model can run bash on the Render server (not with :web)", "think": "thinking, medium", "low": "thinking, brief",
                             "medium": "thinking, step by step", "high": "thinking, deep", "nothink": "no thinking",
                             "tags": "send thinking inside <think> tags in content instead of reasoning_content"},
             "request_fields": ["reasoning_effort", "reasoning.effort", "thinking.type/budget_tokens",
@@ -234,6 +235,8 @@ async def models(authorization: Optional[str] = Header(None)):
     for m in ok:
         curated += [f"{m}:web", f"{m}:web:think"]
     curated += [f"{m}:think" for m in ok[:4]]
+    if SH.enabled():
+        curated += [f"{m}:shell" for m in ok[:3]]
     return {"object": "list", "data": [{"id": m, "object": "model"} for m in curated + ids]}
 
 
@@ -241,6 +244,61 @@ def _delta_chunk(cid, created, model, delta, finish=None):
     c = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
          "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
     return "data: " + json.dumps(c) + "\n\n"
+
+
+async def shell_ask(base: str, params: dict, effort: Optional[str]):
+    native = await use_native()
+
+    async def ask(work: list) -> str:
+        try:
+            text, _ = await call_full(base, work, params, effort if native else None)
+            return text
+        except BackendError as e:
+            return f"[Bridge Error] {e}"
+    return ask
+
+
+async def shell_stream(raw_model, base, msgs, effort, params, tags):
+    """SSE for ':shell' models: each command + result goes into the thinking stream, the final answer is the content."""
+    cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
+    q: asyncio.Queue = asyncio.Queue()
+    ask = await shell_ask(base, params, effort)
+    task = asyncio.create_task(SH.run_agent(ask, msgs, lambda s: q.put_nowait(s)))
+    yield _delta_chunk(cid, created, raw_model, {"role": "assistant", "content": ""})
+    opened, getter = False, None
+    while True:
+        if getter is None:
+            getter = asyncio.ensure_future(q.get())
+        done, _ = await asyncio.wait({getter, task}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+        if getter in done:
+            line = "- " + getter.result() + "\n"
+            getter = None
+            if tags:
+                line, opened = ("" if opened else "<think>\n") + line, True
+                yield _delta_chunk(cid, created, raw_model, {"content": line})
+            else:
+                yield _delta_chunk(cid, created, raw_model, {"reasoning_content": line})
+            continue
+        if task in done:
+            break
+        yield ": keepalive\n\n"
+    if getter is not None and not getter.done():
+        getter.cancel()
+    while not q.empty():
+        line = "- " + q.get_nowait() + "\n"
+        key = "content" if tags else "reasoning_content"
+        if tags and not opened:
+            line, opened = "<think>\n" + line, True
+        yield _delta_chunk(cid, created, raw_model, {key: line})
+    try:
+        answer = task.result()
+    except Exception as e:
+        answer = f"[Bridge Error] {type(e).__name__}: {e}"
+    if tags and opened:
+        answer = "\n</think>\n\n" + answer
+    yield _delta_chunk(cid, created, raw_model, {"content": answer})
+    yield _delta_chunk(cid, created, raw_model, {}, finish="stop")
+    yield "data: [DONE]\n\n"
 
 
 async def stream_response(raw_model, base, msgs, web, effort, params, tags, include_usage):
@@ -378,6 +436,24 @@ async def chat(req: Request, authorization: Optional[str] = Header(None)):
     effort = R.resolve_effort(body, flags)
     msgs = body.get("messages", [])
     params = R.sampling_params(body)
+    if "shell" in flags:
+        if web:
+            return JSONResponse({"error": {"message": "':shell' cannot be combined with ':web' (web pages could inject commands)."}},
+                                status_code=400)
+        if body.get("stream"):
+            return StreamingResponse(shell_stream(raw_model, base, msgs, effort, params, tags),
+                                     media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        lines: list = []
+        answer = await SH.run_agent(await shell_ask(base, params, effort), msgs, lines.append)
+        content = "<think>\n" + "\n".join("- " + x for x in lines) + "\n</think>\n\n" + answer if (tags and lines) else answer
+        msg = {"role": "assistant", "content": content}
+        if lines and not tags:
+            msg["reasoning_content"] = "\n".join("- " + x for x in lines)
+        return JSONResponse({"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion",
+                             "created": int(time.time()), "model": raw_model,
+                             "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
+                             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
     if body.get("stream"):
         inc = bool((body.get("stream_options") or {}).get("include_usage"))
         return StreamingResponse(

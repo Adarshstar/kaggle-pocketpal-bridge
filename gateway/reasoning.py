@@ -13,7 +13,7 @@ Request fields that are honoured too (so PocketPal's own toggles work):
 import re
 from typing import Optional
 
-FLAGS = ("web", "think", "nothink", "tags", "field", "low", "medium", "high")
+FLAGS = ("web", "shell", "think", "nothink", "tags", "field", "low", "medium", "high")
 EFFORT_FLAGS = {"think": "medium", "low": "low", "medium": "medium", "high": "high", "nothink": "none"}
 EFFORTS = ("none", "minimal", "low", "medium", "high")
 OPEN_TAGS = ("think", "thinking", "reasoning", "thought")

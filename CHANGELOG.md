@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.1 - `:shell` models (branch feat/shell)
+- Model id flag `:shell` (e.g. `google/gemini-2.5-flash:shell`): the model can run bash on the Render MCP server
+  (`gh-cli-for-ai-bots`). Prompt-based tool loop in `gateway/shell_agent.py` (one `<run>cmd</run>` per reply, max
+  `SHELL_MAX_STEPS`=8, 60 s per command); commands/results appear in the thinking stream, the final answer is the content.
+- The gateway calls `POST {SHELL_URL}/shell/exec` on the MCP server with header `X-Shell-Key` (secret `SHELL_KEY`, also set
+  as a Render env var; the endpoint is disabled when it is unset). The shell child process does not see `SHELL_KEY` or `RENDER_API_KEY`.
+- `:shell` is rejected together with `:web` (web pages could inject commands). Listed in /v1/models only when SHELL_KEY is set.
+
 ## 3.0 - real token streaming + native thinking (branch feat/native-stream)
 - Kaggle bridge (kaggle/bridge.py v3): each request runs in its own `kbench.chats.new()` chat (no history leak);
   calls `llm.prompt(reasoning=..., seed, temperature, extra_api_params={max_tokens, top_p, stop, ...})`; returns the

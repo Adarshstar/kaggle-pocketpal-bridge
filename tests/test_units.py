@@ -1,6 +1,7 @@
 """Offline unit tests (no network): PYTHONPATH=. python tests/test_units.py"""
 from gateway import reasoning as R
 from gateway import search as S
+from gateway import shell_agent as SH
 
 
 def test_parse_model_flags():
@@ -107,6 +108,35 @@ def test_sources_footer():
     assert "[2] Two" in S.sources_footer("see [2]", info) and "[1]" not in S.sources_footer("see [2]", info)
     assert "[1] One" in S.sources_footer("no cites", info)
     assert S.sources_footer("x", {}) == ""
+
+
+def test_shell_flag_and_extract():
+    assert R.parse_model("google/gemini-2.5-flash:shell") == ("google/gemini-2.5-flash", {"shell"})
+    assert SH.extract("sure\n<run>ls -la /tmp</run>") == "ls -la /tmp"
+    assert SH.extract("<RUN>\n echo hi \n</RUN>") == "echo hi"
+    assert SH.extract("no command here") is None
+    assert SH.extract("<run>   </run>") is None
+    assert SH.strip_runs("a <run>x</run> b") == "a  b"
+    assert "exit code: 2" in SH.format_result({"code": 2, "stderr": "boom"})
+
+
+def test_shell_agent_loop():
+    import asyncio
+    SH.SHELL_URL, SH.SHELL_KEY = "http://x", "k"
+    calls, log = [], []
+
+    async def fake_exec(cmd):
+        calls.append(cmd)
+        return {"code": 0, "stdout": "hello\\n", "stderr": ""}
+    SH.exec_cmd = fake_exec
+    replies = iter(["<run>echo hello</run>", "Done: it printed hello."])
+
+    async def ask(work):
+        return next(replies)
+    out = asyncio.run(SH.run_agent(ask, [{"role": "user", "content": "say hello"}], log.append))
+    assert calls == ["echo hello"] and out == "Done: it printed hello." and log[0] == "$ echo hello"
+    SH.SHELL_KEY = ""
+    assert "not configured" in asyncio.run(SH.run_agent(ask, [], log.append))
 
 
 if __name__ == "__main__":

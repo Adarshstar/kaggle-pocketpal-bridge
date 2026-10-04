@@ -23,6 +23,8 @@ jobs:
     env:
       BRIDGE_KEY: ${{ secrets.BRIDGE_KEY }}
       NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+      SHELL_KEY: ${{ secrets.SHELL_KEY }}
+      SHELL_URL: https://gh-cli-for-ai-bots.onrender.com
       GH_TOKEN: ${{ github.token }}
       SEARXNG_URL: http://127.0.0.1:8888
       MODE: ${{ inputs.mode }}

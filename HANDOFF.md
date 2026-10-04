@@ -173,3 +173,9 @@ Gemini 2.5 Pro cannot turn thinking off, so `:nothink` may fall back to default 
 - Auto re-launch of the Kaggle notebook (scheduled `kaggle kernels push` from a GitHub Action using KAGGLE_API_TOKEN).
 - Quota guard: count requests and warn/limit expensive models.
 - Optional public-repo switch for unlimited Actions minutes.
+
+## 6c. `:shell` models (v3.1)
+Model id suffix `:shell` lets a model run bash on the Render MCP server (service `gh-cli-for-ai-bots`, repo TASP1/gh-cli-mobile-native-mcp,
+endpoint `POST /shell/exec`, password = secret `SHELL_KEY` on both sides). Code: `gateway/shell_agent.py`. Not combinable with `:web`.
+The shell runs as a non-root user and without SHELL_KEY / RENDER_API_KEY in its environment, but it does see GH_TOKEN and the OCI keys.
+Note: the MCP's own `/mcp` endpoint has no authentication (anyone with the URL can use its terminal tools) - see the security note in the chat/CHANGELOG.
