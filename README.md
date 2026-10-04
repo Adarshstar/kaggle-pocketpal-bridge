@@ -1,5 +1,7 @@
 # kaggle-pocketpal-bridge
 
+Full context for humans and AI agents: see HANDOFF.md (and AGENTS.md).
+
 OpenAI-compatible bridge for PocketPal: Kaggle free AI quota + free FOSS web search (SearXNG).
 
     PocketPal -> ngrok static domain -> [GitHub Actions: gateway + SearXNG] -> Kaggle notebook (LLM)
